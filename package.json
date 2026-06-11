@@ -1,0 +1,21 @@
+{
+  "name": "istv-slack-onboarding-bot",
+  "version": "2.0.0",
+  "description": "ISTV AI Department Slack bot — onboarding automation, RAG knowledge base, DLOA analysis, Monday.com sync",
+  "main": "api/index.js",
+  "scripts": {
+    "dev": "node api/index.js",
+    "test": "node lib/test.js",
+    "seed-knowledge": "node lib/knowledge.js --seed"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.24.3",
+    "@slack/web-api": "^7.0.2",
+    "axios": "^1.6.8",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.3",
+    "googleapis": "^140.0.0",
+    "node-cron": "^3.0.3",
+    "node-fetch": "^2.7.0"
+  }
+}

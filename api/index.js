@@ -12,7 +12,7 @@ const sheets = require('../lib/sheets')
 const onboarding = require('../lib/onboarding')
 const knowledge = require('../lib/knowledge')
 const zoom = require('../lib/zoom')
-const monday = require('../lib/monday')
+const questionnaire = require('../lib/questionnaire')
 
 const app = express()
 
@@ -20,7 +20,7 @@ const app = express()
 app.use(express.json({
   verify: (req, res, buf) => { req.rawBody = buf }
 }))
-app.use(express.urlencoded({ extended: true }))
+app.use(express.urlencoded({ extended: true, verify: (req, res, buf) => { req.rawBody = buf } }))
 
 // ── Verify Slack request signature ───────────────────────────────────────────
 function verifySlackSignature(req) {
@@ -48,17 +48,145 @@ function verifySlackSignature(req) {
 app.get('/', (req, res) => res.json({
   status: 'ISTV Slack Bot v2 running',
   time: new Date().toISOString(),
-  version: '2.0.0',
-  features: ['onboarding', 'rag-knowledge-base', 'dloa-analysis', 'monday-sync', 'zoom-transcripts', 'slack-chat']
+  version: '2.1.0',
+  features: [
+    '/onboard slash command',
+    'interactive questionnaire',
+    'rag-knowledge-base',
+    'dloa-analysis',
+    'eod-channel-summaries',
+    'slack-chat',
+    'document-sharing'
+  ]
 }))
 
 app.get('/health', (req, res) => res.json({ ok: true }))
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SLACK SLASH COMMAND — /onboard @username
+// POST /slack/commands
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/slack/commands', async (req, res) => {
+  if (!verifySlackSignature(req)) {
+    return res.status(401).json({ error: 'Invalid signature' })
+  }
+
+  const { command, text, user_id: callerId } = req.body
+
+  if (command !== '/onboard') {
+    return res.json({ text: `Unknown command: ${command}` })
+  }
+
+  // Only Taulant and Tyler can run /onboard
+  const allowed = [process.env.TAULANT_SLACK_ID, process.env.TYLER_SLACK_ID].filter(Boolean)
+  if (allowed.length && !allowed.includes(callerId)) {
+    return res.json({ text: '⛔ Only Taulant or Tyler can run /onboard.' })
+  }
+
+  // Parse the target user — accepts @mention (<@U123|name>) or plain text name
+  const mentionMatch = (text || '').match(/<@([A-Z0-9]+)(?:\|[^>]+)?>/)
+  const targetSlackId = mentionMatch ? mentionMatch[1] : null
+
+  if (!targetSlackId) {
+    return res.json({
+      text: '❌ Please mention the new hire. Usage: `/onboard @username`\n\nExample: `/onboard @john`'
+    })
+  }
+
+  // Acknowledge immediately — Slack requires < 3s
+  res.json({ text: `⏳ Starting onboarding for <@${targetSlackId}>...` })
+
+  // Run async
+  try {
+    await runOnboardingFlow(targetSlackId, callerId)
+  } catch (err) {
+    console.error('/onboard error:', err.message)
+  }
+})
+
+// ── Full onboarding flow triggered by /onboard ────────────────────────────────
+async function runOnboardingFlow(targetSlackId, callerId) {
+  console.log(`\n🚀 /onboard triggered by ${callerId} for ${targetSlackId}`)
+
+  // Look up the user's name from Slack
+  let name = 'New Hire'
+  let role = 'AI Department'
+  try {
+    const userInfo = await slack.client.users.info({ user: targetSlackId })
+    name = userInfo.user.real_name || userInfo.user.name || 'New Hire'
+  } catch {}
+
+  // Check if they're in the Google Sheet (to get role)
+  try {
+    const roster = await sheets.getHiredRoster()
+    const match = roster.find(h =>
+      h['⭐ SLACK ID ⭐'] === targetSlackId ||
+      h['Slack ID'] === targetSlackId ||
+      (h['Name'] && name && h['Name'].toLowerCase().includes(name.toLowerCase().split(' ')[0]))
+    )
+    if (match) role = match['Role'] || role
+  } catch {}
+
+  const hire = {
+    name,
+    role,
+    slackId: targetSlackId,
+    startDate: new Date().toLocaleDateString('en-US')
+  }
+
+  // Step 1: Create channel, add to all department channels, post welcome, update sheets
+  const result = await onboarding.onboardNewHire(hire)
+  hire.channelId = result.channelId
+
+  // Step 2: Share onboarding documents from source channels
+  await onboarding.shareOnboardingDocuments(hire)
+
+  // Step 3: Start questionnaire via DM
+  if (hire.slackId) {
+    await questionnaire.startQuestionnaire(hire)
+  }
+
+  console.log(`✅ Onboarding flow complete for ${name}`)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SLACK INTERACTIVE — Button clicks (questionnaire responses)
+// POST /slack/interactive
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/slack/interactive', async (req, res) => {
+  if (!verifySlackSignature(req)) {
+    return res.status(401).json({ error: 'Invalid signature' })
+  }
+
+  // Payload comes as URL-encoded JSON string in the "payload" field
+  let payload
+  try {
+    payload = JSON.parse(req.body.payload)
+  } catch {
+    return res.status(400).json({ error: 'Invalid payload' })
+  }
+
+  // Acknowledge immediately
+  res.status(200).send()
+
+  if (payload.type !== 'block_actions') return
+
+  const userId = payload.user?.id
+  const action = payload.actions?.[0]
+  if (!userId || !action) return
+
+  try {
+    const data = JSON.parse(action.value || '{}')
+    await questionnaire.handleButtonResponse(userId, data.questionId, data.value)
+  } catch (err) {
+    console.error('Interactive handler error:', err.message)
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SLACK EVENTS
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/slack/events', async (req, res) => {
-  // URL verification challenge
   if (req.body.type === 'url_verification') {
     return res.json({ challenge: req.body.challenge })
   }
@@ -67,7 +195,6 @@ app.post('/slack/events', async (req, res) => {
     return res.status(401).json({ error: 'Invalid signature' })
   }
 
-  // Respond immediately — process async
   res.status(200).send()
 
   const event = req.body.event
@@ -82,31 +209,29 @@ app.post('/slack/events', async (req, res) => {
 
 // ── Main Slack event dispatcher ───────────────────────────────────────────────
 async function handleSlackEvent(event) {
-  // Ignore bot messages
   if (event.bot_id || event.subtype === 'bot_message') return
 
-  // @mention in any channel — trigger knowledge base Q&A
   if (event.type === 'app_mention' && event.text) {
     await handleMention(event)
     return
   }
 
-  // Message in a channel (DLOA detection)
   if (event.type === 'message' && event.channel_type !== 'im' && event.text) {
     await handleChannelMessage(event)
     return
   }
 
-  // DM to the bot — Q&A
   if (event.type === 'message' && event.channel_type === 'im' && event.text) {
     await handleDM(event)
     return
   }
 
-  // New workspace member
+  // team_join — log only, no auto-onboard. Use /onboard instead.
   if (event.type === 'team_join') {
-    await handleNewMember(event.user)
-    return
+    const user = event.user
+    if (user && !user.is_bot) {
+      console.log(`👋 New member joined workspace: ${user.real_name || user.name} — use /onboard @${user.name} to onboard them`)
+    }
   }
 }
 
@@ -115,57 +240,36 @@ async function handleMention(event) {
   const channelId = event.channel
   const userId = event.user
   const threadTs = event.thread_ts || event.ts
-
-  // Strip the bot mention from the text
-  const rawText = event.text || ''
-  const question = rawText.replace(/<@[A-Z0-9]+>/g, '').trim()
+  const question = (event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim()
 
   if (!question) return
 
   console.log(`💬 @mention from ${userId}: ${question.substring(0, 80)}`)
 
-  // Show typing indicator
-  try {
-    await slack.client.reactions.add({ channel: channelId, timestamp: event.ts, name: 'thinking_face' })
-  } catch {}
+  try { await slack.client.reactions.add({ channel: channelId, timestamp: event.ts, name: 'thinking_face' }) } catch {}
 
-  // Look up who this person is
   let askerName = 'Team member'
   let askerRole = ''
   try {
     const onboardees = await sheets.getActiveOnboardees()
     const hire = onboardees.find(h => h['⭐ Slack ID ⭐'] === userId || h['Slack ID'] === userId)
-    if (hire) {
-      askerName = hire['Name']
-      askerRole = hire['Role']
-    }
+    if (hire) { askerName = hire['Name']; askerRole = hire['Role'] }
   } catch {}
 
-  // Answer from knowledge base
   const answer = await claudeAI.answerMention(question, askerName, askerRole)
 
-  // Remove thinking indicator
-  try {
-    await slack.client.reactions.remove({ channel: channelId, timestamp: event.ts, name: 'thinking_face' })
-  } catch {}
+  try { await slack.client.reactions.remove({ channel: channelId, timestamp: event.ts, name: 'thinking_face' }) } catch {}
 
-  // Reply in thread
   await slack.postToChannel(channelId, {
     blocks: [
-      {
-        type: 'section',
-        text: { type: 'mrkdwn', text: answer }
-      },
-      {
-        type: 'context',
-        elements: [{ type: 'mrkdwn', text: `_Answered by ISTV Bot using department knowledge base_` }]
-      }
+      { type: 'section', text: { type: 'mrkdwn', text: answer } },
+      { type: 'context', elements: [{ type: 'mrkdwn', text: '_Answered by ISTV Bot using department knowledge base_' }] }
     ],
     thread_ts: threadTs
   })
 }
 
-// ── Handle messages in channels (DLOA detection) ─────────────────────────────
+// ── Handle channel messages (DLOA detection) ──────────────────────────────────
 async function handleChannelMessage(event) {
   const text = event.text || ''
   const userId = event.user
@@ -176,12 +280,8 @@ async function handleChannelMessage(event) {
   console.log(`📝 DLOA detected from ${userId}`)
   cronJobs.recordDLOA(userId, text)
 
-  // React with checkmark
-  try {
-    await slack.client.reactions.add({ channel: channelId, timestamp: event.ts, name: 'white_check_mark' })
-  } catch {}
+  try { await slack.client.reactions.add({ channel: channelId, timestamp: event.ts, name: 'white_check_mark' }) } catch {}
 
-  // Get hire info
   let hire = null
   try {
     const onboardees = await sheets.getActiveOnboardees()
@@ -194,26 +294,19 @@ async function handleChannelMessage(event) {
   const daysSinceStart = Math.floor((new Date() - startDate) / (1000 * 60 * 60 * 24))
   const hireData = { name: hire['Name'], role: hire['Role'], daysSinceStart }
 
-  // Run DLOA analysis and Monday sync in parallel
-  const [analysis, mondayResult] = await Promise.allSettled([
-    claudeAI.analyseDLOA(hireData, text, cronJobs.getDLOAs(userId).slice(-3).map(d => d.text)),
-    monday.syncDLOAToMonday(text, hireData)
-  ])
+  // Analyse DLOA (skip Monday sync — disabled)
+  const analysis = await claudeAI.analyseDLOA(
+    hireData, text, cronJobs.getDLOAs(userId).slice(-3).map(d => d.text)
+  ).catch(() => null)
 
-  // Send analysis to admin channel
   const adminChannel = process.env.ADMIN_CHANNEL_ID
-  if (adminChannel && analysis.status === 'fulfilled' && analysis.value) {
-    await slack.postToChannel(adminChannel, messages.dloaAnalysisMessage(hireData, analysis.value))
+  if (adminChannel && analysis) {
+    await slack.postToChannel(adminChannel, messages.dloaAnalysisMessage(hireData, analysis))
   }
 
-  // Also store DLOA in knowledge base for future Q&A
+  // Store in knowledge base
   const dloaTitle = `DLOA: ${hire['Name']} — ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`
-  await knowledge.addDocument(dloaTitle, text, 'dloa', {
-    slackId: userId,
-    name: hire['Name'],
-    role: hire['Role'],
-    daysSinceStart
-  }).catch(() => {})
+  await knowledge.addDocument(dloaTitle, text, 'dloa', { slackId: userId, name: hire['Name'], role: hire['Role'], daysSinceStart }).catch(() => {})
 }
 
 // ── Handle DMs to the bot ─────────────────────────────────────────────────────
@@ -225,7 +318,13 @@ async function handleDM(event) {
 
   console.log(`💬 DM from ${userId}: ${text.substring(0, 60)}`)
 
-  // Find this person
+  // If user is mid-questionnaire, hand off to questionnaire handler first
+  if (questionnaire.isInQuestionnaire(userId)) {
+    const handled = await questionnaire.handleTextResponse(userId, text)
+    if (handled) return
+  }
+
+  // Otherwise answer from knowledge base
   let hireName = 'Team member'
   let hireRole = ''
   try {
@@ -237,40 +336,13 @@ async function handleDM(event) {
   try {
     const answer = await claudeAI.answerNewHireQuestion(text, hireName, hireRole)
     await slack.sendDM(userId, answer)
-  } catch (err) {
+  } catch {
     await slack.sendDM(userId, `I couldn't process that right now. Message Taulant in your onboarding channel for help.`)
   }
 }
 
-// ── Handle new workspace member ───────────────────────────────────────────────
-async function handleNewMember(user) {
-  if (!user || user.is_bot) return
-  console.log(`👋 New member joined: ${user.real_name || user.name}`)
-
-  try {
-    const roster = await sheets.getHiredRoster()
-    const hire = roster.find(h =>
-      h['Name'] && h['Name'].toLowerCase().includes((user.real_name || '').toLowerCase().split(' ')[0]) ||
-      (user.profile?.email && h['Company Email'] === user.profile.email)
-    )
-
-    if (hire && !hire['Onboarding Channel']) {
-      await onboarding.onboardNewHire({
-        name: hire['Name'],
-        role: hire['Role'],
-        slackId: user.id,
-        email: user.profile?.email || hire['Company Email'] || '',
-        startDate: hire['Start Date'] || new Date().toLocaleDateString('en-US'),
-        _rowIndex: hire._rowIndex
-      })
-    }
-  } catch (err) {
-    console.error('New member handler error:', err.message)
-  }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// MAKE.COM WEBHOOK — New hire trigger from Make.com
+// MAKE.COM WEBHOOK — queues a hire for manual /onboard trigger
 // POST /webhook/new-hire
 // Body: { secret, name, role, email, slackEmail, startDate }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -280,99 +352,67 @@ app.post('/webhook/new-hire', async (req, res) => {
   if (secret !== process.env.WEBHOOK_SECRET) {
     return res.status(403).json({ error: 'Invalid secret' })
   }
+  if (!name || !role) return res.status(400).json({ error: 'name and role required' })
 
-  if (!name || !role) {
-    return res.status(400).json({ error: 'name and role are required' })
+  // Notify Taulant to run /onboard when ready
+  const adminChannel = process.env.ADMIN_CHANNEL_ID
+  if (adminChannel) {
+    await slack.postToChannel(adminChannel, {
+      blocks: [{
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `🆕 *New hire registered via Make.com*\n*Name:* ${name}\n*Role:* ${role}\n*Start date:* ${startDate || 'TBD'}\n*Email:* ${email || slackEmail || 'not provided'}\n\nWhen they join Slack, run \`/onboard @${name.split(' ')[0].toLowerCase()}\` to start onboarding.`
+        }
+      }]
+    }).catch(() => {})
   }
 
-  try {
-    // Find their Slack ID by email if slackEmail is provided
-    let slackId = ''
-    if (slackEmail || email) {
-      const user = await slack.findUserByEmail(slackEmail || email)
-      if (user) slackId = user.id
-    }
-
-    const result = await onboarding.onboardNewHire({
-      name,
-      role,
-      slackId,
-      email: email || '',
-      startDate: startDate || new Date().toLocaleDateString('en-US')
-    })
-
-    res.json({ ok: true, result })
-  } catch (err) {
-    console.error('Make.com webhook error:', err.message)
-    res.status(500).json({ ok: false, error: err.message })
-  }
+  res.json({ ok: true, message: 'Hire registered. Use /onboard @username in Slack when they join.' })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ZOOM WEBHOOK — Receives recording.completed events
-// POST /webhook/zoom
+// ZOOM WEBHOOK
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/webhook/zoom', async (req, res) => {
-  // Zoom URL validation challenge
   if (req.body?.event === 'endpoint.url_validation') {
     const hashForValidate = createHmac('sha256', process.env.ZOOM_VERIFICATION_TOKEN || '')
       .update(req.body.payload.plainToken)
       .digest('hex')
-    return res.json({
-      plainToken: req.body.payload.plainToken,
-      encryptedToken: hashForValidate
-    })
+    return res.json({ plainToken: req.body.payload.plainToken, encryptedToken: hashForValidate })
   }
 
-  // Verify token
-  if (!zoom.verifyZoomWebhook(req)) {
-    return res.status(401).json({ error: 'Invalid Zoom token' })
-  }
+  if (!zoom.verifyZoomWebhook(req)) return res.status(401).json({ error: 'Invalid Zoom token' })
 
-  // Respond immediately
   res.status(200).json({ ok: true })
 
-  // Process async
   try {
     const result = await zoom.handleZoomWebhook(req.body)
-    console.log('Zoom webhook processed:', result)
-
-    // If a transcript was added, post summary to admin channel
     if (result.ok && result.chunksAdded > 0 && process.env.ADMIN_CHANNEL_ID) {
-      const summaryText = `📹 *Zoom transcript added to knowledge base*\n*Meeting:* ${result.title}\n*Participants:* ${(result.participants || []).join(', ') || 'Unknown'}\n*Chunks indexed:* ${result.chunksAdded}\n\nYou can now @mention the bot in any channel to ask questions about this meeting.`
-
       await slack.postToChannel(process.env.ADMIN_CHANNEL_ID, {
         blocks: [{
           type: 'section',
-          text: { type: 'mrkdwn', text: summaryText }
+          text: { type: 'mrkdwn', text: `📹 *Zoom transcript added*\n*Meeting:* ${result.title}\n*Chunks indexed:* ${result.chunksAdded}\n\n@mention the bot to ask questions about this meeting.` }
         }]
       })
     }
   } catch (err) {
-    console.error('Zoom webhook processing error:', err.message)
+    console.error('Zoom webhook error:', err.message)
   }
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
 // KNOWLEDGE BASE API
 // ─────────────────────────────────────────────────────────────────────────────
-
-// GET /knowledge — list all documents
 app.get('/knowledge', async (req, res) => {
-  const auth = req.headers['x-api-key']
-  if (auth !== process.env.WEBHOOK_SECRET) return res.status(403).json({ error: 'Unauthorized' })
-  const docs = knowledge.listDocuments()
-  res.json({ ok: true, count: docs.length, documents: docs })
+  if (req.headers['x-api-key'] !== process.env.WEBHOOK_SECRET) return res.status(403).json({ error: 'Unauthorized' })
+  res.json({ ok: true, count: knowledge.listDocuments().length, documents: knowledge.listDocuments() })
 })
 
-// POST /knowledge/add — manually add a document
 app.post('/knowledge/add', async (req, res) => {
-  const auth = req.headers['x-api-key']
-  if (auth !== process.env.WEBHOOK_SECRET) return res.status(403).json({ error: 'Unauthorized' })
-
+  if (req.headers['x-api-key'] !== process.env.WEBHOOK_SECRET) return res.status(403).json({ error: 'Unauthorized' })
   const { title, content, type } = req.body
   if (!title || !content) return res.status(400).json({ error: 'title and content required' })
-
   try {
     const chunks = await knowledge.addDocument(title, content, type || 'document')
     res.json({ ok: true, title, chunksAdded: chunks })
@@ -381,14 +421,10 @@ app.post('/knowledge/add', async (req, res) => {
   }
 })
 
-// POST /knowledge/search — search the knowledge base
 app.post('/knowledge/search', async (req, res) => {
-  const auth = req.headers['x-api-key']
-  if (auth !== process.env.WEBHOOK_SECRET) return res.status(403).json({ error: 'Unauthorized' })
-
+  if (req.headers['x-api-key'] !== process.env.WEBHOOK_SECRET) return res.status(403).json({ error: 'Unauthorized' })
   const { query } = req.body
   if (!query) return res.status(400).json({ error: 'query required' })
-
   try {
     const results = await knowledge.searchKnowledge(query)
     res.json({ ok: true, count: results.length, results })
@@ -397,30 +433,21 @@ app.post('/knowledge/search', async (req, res) => {
   }
 })
 
-// DELETE /knowledge/:title — delete a document
 app.delete('/knowledge/:title', async (req, res) => {
-  const auth = req.headers['x-api-key']
-  if (auth !== process.env.WEBHOOK_SECRET) return res.status(403).json({ error: 'Unauthorized' })
-
-  const title = decodeURIComponent(req.params.title)
-  const deleted = knowledge.deleteDocument(title)
+  if (req.headers['x-api-key'] !== process.env.WEBHOOK_SECRET) return res.status(403).json({ error: 'Unauthorized' })
+  const deleted = knowledge.deleteDocument(decodeURIComponent(req.params.title))
   res.json({ ok: true, deleted })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MANUAL TRIGGERS
+// MANUAL TRIGGERS (testing)
 // ─────────────────────────────────────────────────────────────────────────────
-
-// POST /trigger/onboard — manually trigger onboarding (testing)
 app.post('/trigger/onboard', async (req, res) => {
   const { secret, name, role, slackId, startDate } = req.body
-
   if (secret !== process.env.WEBHOOK_SECRET && secret !== 'istv-trigger-2026') {
     return res.status(403).json({ error: 'Invalid secret' })
   }
-
   if (!name || !role) return res.status(400).json({ error: 'name and role required' })
-
   try {
     const result = await onboarding.onboardNewHire({
       name, role,
@@ -434,29 +461,11 @@ app.post('/trigger/onboard', async (req, res) => {
   }
 })
 
-// POST /trigger/zoom-transcript — manually upload a Zoom VTT transcript
 app.post('/trigger/zoom-transcript', async (req, res) => {
-  const { secret, title, content } = req.body
-
-  if (secret !== process.env.WEBHOOK_SECRET) return res.status(403).json({ error: 'Invalid secret' })
-  if (!title || !content) return res.status(400).json({ error: 'title and content required' })
-
+  if (req.body.secret !== process.env.WEBHOOK_SECRET) return res.status(403).json({ error: 'Invalid secret' })
+  if (!req.body.title || !req.body.content) return res.status(400).json({ error: 'title and content required' })
   try {
-    const result = await zoom.addTranscriptFromText(title, content)
-    res.json(result)
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message })
-  }
-})
-
-// GET /cron/poll — Vercel cron endpoint to poll Google Sheets
-app.get('/cron/poll', async (req, res) => {
-  const auth = req.headers['x-cron-secret'] || req.query.secret
-  if (auth !== process.env.CRON_SECRET) return res.status(403).json({ error: 'Unauthorized' })
-
-  try {
-    await cronJobs.pollForNewHires()
-    res.json({ ok: true, time: new Date().toISOString() })
+    res.json(await zoom.addTranscriptFromText(req.body.title, req.body.content))
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message })
   }
@@ -469,29 +478,25 @@ const PORT = process.env.PORT || 3000
 
 app.listen(PORT, async () => {
   console.log('\n' + '═'.repeat(55))
-  console.log('  ISTV AI Department Slack Bot v2')
+  console.log('  ISTV AI Department Slack Bot v2.1')
   console.log('  The Shipping Department — AI Engine of ISTV')
   console.log('═'.repeat(55))
   console.log(`  Port: ${PORT}`)
   console.log(`  Environment: ${process.env.NODE_ENV || 'development'}`)
   console.log('═'.repeat(55))
   console.log('  Features:')
-  console.log('  ✓ Onboarding automation (channel, welcome, channels)')
+  console.log('  ✓ /onboard slash command (manual trigger)')
+  console.log('  ✓ Interactive onboarding questionnaire')
+  console.log('  ✓ Document sharing from source channels')
   console.log('  ✓ DLOA detection + Claude analysis')
-  console.log('  ✓ DLOA → Monday.com sync')
-  console.log('  ✓ RAG knowledge base (department docs + transcripts)')
-  console.log('  ✓ @mention Q&A in any channel')
-  console.log('  ✓ DM Q&A for new hires')
-  console.log('  ✓ Zoom transcript webhook → knowledge base')
-  console.log('  ✓ Make.com webhook → auto-onboarding')
+  console.log('  ✓ RAG knowledge base (docs + transcripts)')
+  console.log('  ✓ @mention + DM Q&A for new hires')
+  console.log('  ✓ EOD channel summaries → admin (5pm EST)')
+  console.log('  ✓ Make.com webhook → admin alert')
   console.log('═'.repeat(55) + '\n')
 
-  // Seed knowledge base with department docs
-  try {
-    await knowledge.seedDepartmentDocs()
-  } catch {}
+  try { await knowledge.seedDepartmentDocs() } catch {}
 
-  // Register cron jobs
   if (process.env.NODE_ENV === 'production' || process.env.ENABLE_CRON === 'true') {
     cronJobs.registerCronJobs()
     console.log('✅ Cron jobs active\n')

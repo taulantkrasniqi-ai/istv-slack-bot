@@ -13,6 +13,7 @@ const onboarding = require('../lib/onboarding')
 const knowledge = require('../lib/knowledge')
 const zoom = require('../lib/zoom')
 const questionnaire = require('../lib/questionnaire')
+const eod = require('../lib/eod')
 
 const app = express()
 
@@ -101,6 +102,12 @@ app.post('/slack/commands', async (req, res) => {
     await runOnboardingFlow(targetSlackId, callerId)
   } catch (err) {
     console.error('/onboard error:', err.message)
+    const adminChannel = process.env.ADMIN_CHANNEL_ID
+    if (adminChannel) {
+      await slack.postToChannel(adminChannel, {
+        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `❌ *Onboarding failed* for <@${targetSlackId}>\nError: ${err.message}` } }]
+      }).catch(() => {})
+    }
   }
 })
 
@@ -256,7 +263,12 @@ async function handleMention(event) {
     if (hire) { askerName = hire['Name']; askerRole = hire['Role'] }
   } catch {}
 
-  const answer = await claudeAI.answerMention(question, askerName, askerRole)
+  let answer = `I couldn't process that right now. Try again or message Taulant.`
+  try {
+    answer = await claudeAI.answerMention(question, askerName, askerRole)
+  } catch (err) {
+    console.error('Claude mention error:', err.message)
+  }
 
   try { await slack.client.reactions.remove({ channel: channelId, timestamp: event.ts, name: 'thinking_face' }) } catch {}
 
@@ -288,9 +300,10 @@ async function handleChannelMessage(event) {
     hire = onboardees.find(h => h['⭐ Slack ID ⭐'] === userId || h['Slack ID'] === userId)
   } catch {}
 
-  if (!hire) return
+  if (!hire || !hire['Start Date']) return
 
   const startDate = new Date(hire['Start Date'])
+  if (isNaN(startDate.getTime())) return
   const daysSinceStart = Math.floor((new Date() - startDate) / (1000 * 60 * 60 * 24))
   const hireData = { name: hire['Name'], role: hire['Role'], daysSinceStart }
 
@@ -440,6 +453,64 @@ app.delete('/knowledge/:title', async (req, res) => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
+// VERCEL CRON ENDPOINTS
+// Called by Vercel on schedule (UTC times — EST offsets applied in vercel.json)
+// All times below are EST equivalents:
+//   /cron/morning       → 9am  EST (day-one messages + check-in reminders)
+//   /cron/profile-check → 10am EST
+//   /cron/dloa-reminder → 4:30pm EST
+//   /cron/eod           → 5pm  EST (channel summaries)
+//   /cron/dloa-check    → 6pm  EST (missing DLOA alerts)
+//   /cron/weekly        → 5:30pm EST Friday
+// ─────────────────────────────────────────────────────────────────────────────
+function isCronAuthorised(req) {
+  // Vercel sets x-vercel-cron: 1 on all cron requests
+  if (req.headers['x-vercel-cron'] === '1') return true
+  // Allow manual trigger with CRON_SECRET
+  const auth = req.headers['authorization'] || req.query.secret
+  return auth === process.env.CRON_SECRET || auth === `Bearer ${process.env.CRON_SECRET}`
+}
+
+app.get('/cron/morning', async (req, res) => {
+  if (!isCronAuthorised(req)) return res.status(403).json({ error: 'Unauthorized' })
+  res.json({ ok: true })
+  await Promise.allSettled([
+    cronJobs.sendDayOneMessages(),
+    cronJobs.sendCheckinReminders()
+  ])
+})
+
+app.get('/cron/profile-check', async (req, res) => {
+  if (!isCronAuthorised(req)) return res.status(403).json({ error: 'Unauthorized' })
+  res.json({ ok: true })
+  await cronJobs.runProfileChecks().catch(console.error)
+})
+
+app.get('/cron/dloa-reminder', async (req, res) => {
+  if (!isCronAuthorised(req)) return res.status(403).json({ error: 'Unauthorized' })
+  res.json({ ok: true })
+  await cronJobs.sendDLOAReminders().catch(console.error)
+})
+
+app.get('/cron/eod', async (req, res) => {
+  if (!isCronAuthorised(req)) return res.status(403).json({ error: 'Unauthorized' })
+  res.json({ ok: true })
+  await eod.sendEODSummary().catch(console.error)
+})
+
+app.get('/cron/dloa-check', async (req, res) => {
+  if (!isCronAuthorised(req)) return res.status(403).json({ error: 'Unauthorized' })
+  res.json({ ok: true })
+  await cronJobs.checkMissingDLOAs().catch(console.error)
+})
+
+app.get('/cron/weekly', async (req, res) => {
+  if (!isCronAuthorised(req)) return res.status(403).json({ error: 'Unauthorized' })
+  res.json({ ok: true })
+  await cronJobs.sendWeeklySummaries().catch(console.error)
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MANUAL TRIGGERS (testing)
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/trigger/onboard', async (req, res) => {
@@ -497,12 +568,8 @@ app.listen(PORT, async () => {
 
   try { await knowledge.seedDepartmentDocs() } catch {}
 
-  if (process.env.NODE_ENV === 'production' || process.env.ENABLE_CRON === 'true') {
-    cronJobs.registerCronJobs()
-    console.log('✅ Cron jobs active\n')
-  } else {
-    console.log('⚠️  Cron jobs disabled (set ENABLE_CRON=true to enable locally)\n')
-  }
+  // Cron jobs run via Vercel Cron (HTTP endpoints in vercel.json) — not node-cron
+  console.log('✅ Cron endpoints active (/cron/morning, /cron/dloa-reminder, /cron/eod, etc.)\n')
 })
 
 module.exports = app

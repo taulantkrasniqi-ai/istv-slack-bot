@@ -13,13 +13,11 @@
     }
   ],
   "crons": [
-    {
-      "path": "/cron/poll",
-      "schedule": "*/5 * * * *"
-    }
-  ],
-  "env": {
-    "NODE_ENV": "production",
-    "ENABLE_CRON": "true"
-  }
+    { "path": "/cron/morning",        "schedule": "0 14 * * 1-5"  },
+    { "path": "/cron/profile-check",  "schedule": "0 15 * * 1-5"  },
+    { "path": "/cron/dloa-reminder",  "schedule": "30 21 * * 1-5" },
+    { "path": "/cron/eod",            "schedule": "0 22 * * 1-5"  },
+    { "path": "/cron/dloa-check",     "schedule": "0 23 * * 1-5"  },
+    { "path": "/cron/weekly",         "schedule": "30 22 * * 5"   }
+  ]
 }

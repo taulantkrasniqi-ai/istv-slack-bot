@@ -86,22 +86,29 @@ app.post('/slack/commands', async (req, res) => {
     return res.json({ text: '⛔ Only Taulant or Tyler can run /onboard.' })
   }
 
-  // Parse the target user — accepts @mention (<@U123|name>) or plain text name
-  const mentionMatch = (text || '').match(/<@([A-Z0-9]+)(?:\|[^>]+)?>/)
+  // Parse mention and optional role — /onboard @john AI Operations Engineer
+  const mentionMatch = (text || '').match(/<@([A-Z0-9]+)(?:\|[^>]+)?>(.*)/)
   const targetSlackId = mentionMatch ? mentionMatch[1] : null
+  const roleFromCommand = mentionMatch ? mentionMatch[2].trim() : ''
 
   if (!targetSlackId) {
     return res.json({
-      text: '❌ Please mention the new hire. Usage: `/onboard @username`\n\nExample: `/onboard @john`'
+      text: '❌ Usage: `/onboard @username Role Name`\n\nExample: `/onboard @john AI Operations Engineer`'
+    })
+  }
+
+  if (!roleFromCommand) {
+    return res.json({
+      text: '❌ Please include the role. Usage: `/onboard @username Role Name`\n\nExample: `/onboard @john AI Operations Engineer`'
     })
   }
 
   // Acknowledge immediately — Slack requires < 3s
-  res.json({ text: `⏳ Starting onboarding for <@${targetSlackId}>...` })
+  res.json({ text: `⏳ Starting onboarding for <@${targetSlackId}> as *${roleFromCommand}*...` })
 
   // Run async
   try {
-    await runOnboardingFlow(targetSlackId, callerId)
+    await runOnboardingFlow(targetSlackId, callerId, roleFromCommand)
   } catch (err) {
     console.error('/onboard error:', err.message)
     const adminChannel = process.env.ADMIN_CHANNEL_ID
@@ -114,20 +121,15 @@ app.post('/slack/commands', async (req, res) => {
 })
 
 // ── Full onboarding flow triggered by /onboard ────────────────────────────────
-async function runOnboardingFlow(targetSlackId, callerId) {
-  console.log(`\n🚀 /onboard triggered by ${callerId} for ${targetSlackId}`)
+async function runOnboardingFlow(targetSlackId, callerId, role = 'AI Department') {
+  console.log(`\n🚀 /onboard triggered by ${callerId} for ${targetSlackId} — role: ${role}`)
 
   // Look up the user's name from Slack
   let name = 'New Hire'
-  let role = 'AI Department'
   try {
     const userInfo = await slack.client.users.info({ user: targetSlackId })
     name = userInfo.user.real_name || userInfo.user.name || 'New Hire'
   } catch {}
-
-  // Check registry for an existing role (set if Make.com webhook was called first)
-  const existing = registry.getHireBySlackId(targetSlackId)
-  if (existing) role = existing.role || role
 
   const hire = {
     name,

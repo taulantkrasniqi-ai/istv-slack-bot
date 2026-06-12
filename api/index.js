@@ -8,12 +8,14 @@ const slack = require('../lib/slack')
 const claudeAI = require('../lib/claude')
 const cronJobs = require('../lib/cron')
 const messages = require('../lib/messages')
-const sheets = require('../lib/sheets')
 const onboarding = require('../lib/onboarding')
 const knowledge = require('../lib/knowledge')
 const zoom = require('../lib/zoom')
 const questionnaire = require('../lib/questionnaire')
 const eod = require('../lib/eod')
+const registry = require('../lib/registry')
+const ingest = require('../lib/ingest')
+const standup = require('../lib/standup')
 
 const app = express()
 
@@ -123,16 +125,9 @@ async function runOnboardingFlow(targetSlackId, callerId) {
     name = userInfo.user.real_name || userInfo.user.name || 'New Hire'
   } catch {}
 
-  // Check if they're in the Google Sheet (to get role)
-  try {
-    const roster = await sheets.getHiredRoster()
-    const match = roster.find(h =>
-      h['⭐ SLACK ID ⭐'] === targetSlackId ||
-      h['Slack ID'] === targetSlackId ||
-      (h['Name'] && name && h['Name'].toLowerCase().includes(name.toLowerCase().split(' ')[0]))
-    )
-    if (match) role = match['Role'] || role
-  } catch {}
+  // Check registry for an existing role (set if Make.com webhook was called first)
+  const existing = registry.getHireBySlackId(targetSlackId)
+  if (existing) role = existing.role || role
 
   const hire = {
     name,
@@ -141,9 +136,10 @@ async function runOnboardingFlow(targetSlackId, callerId) {
     startDate: new Date().toLocaleDateString('en-US')
   }
 
-  // Step 1: Create channel, add to all department channels, post welcome, update sheets
+  // Step 1: Create channel, add to all department channels, post welcome
   const result = await onboarding.onboardNewHire(hire)
   hire.channelId = result.channelId
+  registry.addHire(hire)
 
   // Step 2: Share onboarding documents from source channels
   await onboarding.shareOnboardingDocuments(hire)
@@ -258,9 +254,9 @@ async function handleMention(event) {
   let askerName = 'Team member'
   let askerRole = ''
   try {
-    const onboardees = await sheets.getActiveOnboardees()
-    const hire = onboardees.find(h => h['⭐ Slack ID ⭐'] === userId || h['Slack ID'] === userId)
-    if (hire) { askerName = hire['Name']; askerRole = hire['Role'] }
+    const onboardees = registry.getActiveOnboardees()
+    const hire = onboardees.find(h => h.slackId === userId)
+    if (hire) { askerName = hire.name; askerRole = hire.role }
   } catch {}
 
   let answer = `I couldn't process that right now. Try again or message Taulant.`
@@ -281,11 +277,20 @@ async function handleMention(event) {
   })
 }
 
-// ── Handle channel messages (DLOA detection) ──────────────────────────────────
+// ── Handle channel messages (DLOA detection + auto-ingest) ───────────────────
 async function handleChannelMessage(event) {
   const text = event.text || ''
   const userId = event.user
   const channelId = event.channel
+
+  // Resolve channel name — Slack events include channel_name in some payloads
+  // but not always; we use the event or fall back to a lookup
+  const channelName = event.channel_name || ''
+
+  // Auto-ingest: files or substantial messages from department channels
+  if (channelName && ingest.isIngestChannel(channelName)) {
+    ingest.ingestEvent(event, channelName).catch(() => {})
+  }
 
   if (!slack.looksLikeDLOA(text)) return
 
@@ -296,18 +301,14 @@ async function handleChannelMessage(event) {
 
   let hire = null
   try {
-    const onboardees = await sheets.getActiveOnboardees()
-    hire = onboardees.find(h => h['⭐ Slack ID ⭐'] === userId || h['Slack ID'] === userId)
+    const onboardees = registry.getActiveOnboardees()
+    hire = onboardees.find(h => h.slackId === userId)
   } catch {}
 
-  if (!hire || !hire['Start Date']) return
+  if (!hire) return
 
-  const startDate = new Date(hire['Start Date'])
-  if (isNaN(startDate.getTime())) return
-  const daysSinceStart = Math.floor((new Date() - startDate) / (1000 * 60 * 60 * 24))
-  const hireData = { name: hire['Name'], role: hire['Role'], daysSinceStart }
+  const hireData = { name: hire.name, role: hire.role, daysSinceStart: hire.daysSinceStart }
 
-  // Analyse DLOA (skip Monday sync — disabled)
   const analysis = await claudeAI.analyseDLOA(
     hireData, text, cronJobs.getDLOAs(userId).slice(-3).map(d => d.text)
   ).catch(() => null)
@@ -317,9 +318,8 @@ async function handleChannelMessage(event) {
     await slack.postToChannel(adminChannel, messages.dloaAnalysisMessage(hireData, analysis))
   }
 
-  // Store in knowledge base
-  const dloaTitle = `DLOA: ${hire['Name']} — ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`
-  await knowledge.addDocument(dloaTitle, text, 'dloa', { slackId: userId, name: hire['Name'], role: hire['Role'], daysSinceStart }).catch(() => {})
+  const dloaTitle = `DLOA: ${hire.name} — ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`
+  await knowledge.addDocument(dloaTitle, text, 'dloa', { slackId: userId, name: hire.name, role: hire.role, daysSinceStart: hire.daysSinceStart }).catch(() => {})
 }
 
 // ── Handle DMs to the bot ─────────────────────────────────────────────────────
@@ -331,7 +331,16 @@ async function handleDM(event) {
 
   console.log(`💬 DM from ${userId}: ${text.substring(0, 60)}`)
 
-  // If user is mid-questionnaire, hand off to questionnaire handler first
+  // Priority 1: standup reply
+  if (standup.isAwaitingStandup(userId)) {
+    const handled = standup.handleStandupReply(userId, text)
+    if (handled) {
+      await slack.sendDM(userId, `Got it — I'll include that in the team digest. Good luck today!`)
+      return
+    }
+  }
+
+  // Priority 2: questionnaire
   if (questionnaire.isInQuestionnaire(userId)) {
     const handled = await questionnaire.handleTextResponse(userId, text)
     if (handled) return
@@ -341,9 +350,9 @@ async function handleDM(event) {
   let hireName = 'Team member'
   let hireRole = ''
   try {
-    const onboardees = await sheets.getActiveOnboardees()
-    const hire = onboardees.find(h => h['⭐ Slack ID ⭐'] === userId || h['Slack ID'] === userId)
-    if (hire) { hireName = hire['Name']; hireRole = hire['Role'] }
+    const onboardees = registry.getActiveOnboardees()
+    const hire = onboardees.find(h => h.slackId === userId)
+    if (hire) { hireName = hire.name; hireRole = hire.role }
   } catch {}
 
   try {
@@ -476,14 +485,18 @@ app.get('/cron/morning', async (req, res) => {
   res.json({ ok: true })
   await Promise.allSettled([
     cronJobs.sendDayOneMessages(),
-    cronJobs.sendCheckinReminders()
+    cronJobs.sendCheckinReminders(),
+    standup.sendStandupDMs()           // 9am: DM each hire for standup
   ])
 })
 
 app.get('/cron/profile-check', async (req, res) => {
   if (!isCronAuthorised(req)) return res.status(403).json({ error: 'Unauthorized' })
   res.json({ ok: true })
-  await cronJobs.runProfileChecks().catch(console.error)
+  await Promise.allSettled([
+    cronJobs.runProfileChecks(),
+    standup.postStandupDigest()        // 10am: post standup digest to admin
+  ])
 })
 
 app.get('/cron/dloa-reminder', async (req, res) => {
@@ -507,7 +520,10 @@ app.get('/cron/dloa-check', async (req, res) => {
 app.get('/cron/weekly', async (req, res) => {
   if (!isCronAuthorised(req)) return res.status(403).json({ error: 'Unauthorized' })
   res.json({ ok: true })
-  await cronJobs.sendWeeklySummaries().catch(console.error)
+  await Promise.allSettled([
+    cronJobs.sendWeeklySummaries(),
+    cronJobs.checkRiskFlags()          // Friday: risk flags for Tyler + Taulant
+  ])
 })
 
 // ─────────────────────────────────────────────────────────────────────────────

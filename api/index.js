@@ -853,6 +853,17 @@ app.get('/cron/weekly-digest', async (req, res) => {
   await cronJobs.sendWeeklyKnowledgeDigest().catch(console.error)
 })
 
+app.get('/cron/seed', async (req, res) => {
+  if (!isCronAuthorised(req)) return res.status(403).json({ error: 'Unauthorized' })
+  res.json({ ok: true })
+  try {
+    await knowledge.seedDepartmentDocs()
+    console.log('✅ Knowledge base seeded via cron')
+  } catch (err) {
+    console.error('Seed cron error:', err.message)
+  }
+})
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MANUAL TRIGGERS (testing)
 // ─────────────────────────────────────────────────────────────────────────────

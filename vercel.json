@@ -20,6 +20,7 @@
     { "path": "/cron/dloa-check",     "schedule": "0 23 * * 1-5"  },
     { "path": "/cron/weekly",         "schedule": "30 22 * * 5"   },
     { "path": "/cron/silence-check",  "schedule": "0 17 * * 1-5"  },
-    { "path": "/cron/weekly-digest",  "schedule": "0 14 * * 1"    }
+    { "path": "/cron/weekly-digest",  "schedule": "0 14 * * 1"    },
+    { "path": "/cron/seed",           "schedule": "0 13 * * *"    }
   ]
 }

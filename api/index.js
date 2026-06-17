@@ -16,6 +16,7 @@ const eod = require('../lib/eod')
 const registry = require('../lib/registry')
 const ingest = require('../lib/ingest')
 const standup = require('../lib/standup')
+const scrape = require('../lib/scrape')
 
 const app = express()
 
@@ -75,6 +76,10 @@ app.post('/slack/commands', async (req, res) => {
   }
 
   const { command, text, user_id: callerId } = req.body
+
+  if (command === '/scrape') {
+    return handleScrapeCommand(req, res, text, callerId)
+  }
 
   if (command !== '/onboard') {
     return res.json({ text: `Unknown command: ${command}` })
@@ -152,6 +157,81 @@ async function runOnboardingFlow(targetSlackId, callerId, role = 'AI Department'
   }
 
   console.log(`✅ Onboarding flow complete for ${name}`)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SCRAPE COMMAND — /scrape all  OR  /scrape #channel-name
+// ─────────────────────────────────────────────────────────────────────────────
+async function handleScrapeCommand(req, res, text, callerId) {
+  const allowed = [process.env.TAULANT_SLACK_ID, process.env.TYLER_SLACK_ID].filter(Boolean)
+  if (allowed.length && !allowed.includes(callerId)) {
+    return res.json({ text: '⛔ Only Taulant or Tyler can run /scrape.' })
+  }
+
+  const input = (text || '').trim().toLowerCase()
+  const adminChannel = process.env.ADMIN_CHANNEL_ID
+
+  // /scrape all
+  if (input === 'all') {
+    res.json({ text: `⏳ Scraping all 21 department channels (last ${scrape.DAYS_BACK} days). This will take a few minutes — I'll post updates in the admin channel.` })
+
+    try {
+      const { results, totalMessages, totalIngested } = await scrape.scrapeAll(adminChannel)
+      const skipped = results.filter(r => r.skipped).length
+      const done = results.filter(r => !r.skipped).length
+
+      if (adminChannel) {
+        const lines = results
+          .filter(r => !r.skipped)
+          .map(r => `• *#${r.channelName}* — ${r.messagesScanned} messages, ${r.itemsIngested} items indexed`)
+          .join('\n')
+
+        await slack.postToChannel(adminChannel, {
+          blocks: [
+            { type: 'header', text: { type: 'plain_text', text: '✅ Scrape Complete' } },
+            { type: 'section', text: { type: 'mrkdwn', text: `*${totalMessages}* messages scanned across *${done}* channels\n*${totalIngested}* items added to knowledge base${skipped ? `\n⚠️ ${skipped} channels not found (bot may not be a member)` : ''}` } },
+            { type: 'divider' },
+            { type: 'section', text: { type: 'mrkdwn', text: lines } }
+          ]
+        })
+      }
+    } catch (err) {
+      console.error('/scrape all error:', err.message)
+      if (adminChannel) {
+        await slack.postToChannel(adminChannel, { blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `❌ Scrape failed: ${err.message}` } }] }).catch(() => {})
+      }
+    }
+    return
+  }
+
+  // /scrape #channel-name  (Slack sends channel mentions as <#CXXX|channel-name>)
+  const channelMentionMatch = (text || '').match(/<#([A-Z0-9]+)\|([^>]+)>/)
+  const channelId = channelMentionMatch ? channelMentionMatch[1] : null
+  const channelName = channelMentionMatch ? channelMentionMatch[2] : null
+
+  if (channelId && channelName) {
+    res.json({ text: `⏳ Scraping *#${channelName}* (last ${scrape.DAYS_BACK} days)...` })
+
+    try {
+      const result = await scrape.scrapeChannel(channelId, channelName)
+      if (adminChannel) {
+        await slack.postToChannel(adminChannel, {
+          blocks: [{
+            type: 'section',
+            text: { type: 'mrkdwn', text: `✅ *#${channelName}* scrape done\n${result.messagesScanned} messages scanned — ${result.itemsIngested} items added to knowledge base` }
+          }]
+        })
+      }
+    } catch (err) {
+      console.error(`/scrape #${channelName} error:`, err.message)
+    }
+    return
+  }
+
+  // Bad usage
+  return res.json({
+    text: '❌ Usage:\n• `/scrape all` — scrape all 21 department channels\n• `/scrape #channel-name` — scrape one specific channel'
+  })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

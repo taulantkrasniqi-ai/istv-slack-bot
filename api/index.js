@@ -17,8 +17,12 @@ const registry = require('../lib/registry')
 const ingest = require('../lib/ingest')
 const standup = require('../lib/standup')
 const scrape = require('../lib/scrape')
+const peoplemap = require('../lib/peoplemap')
 
 const app = express()
+
+// ── Module-level state ────────────────────────────────────────────────────────
+const summarisedThreads = new Set()
 
 // ── Body parsing ──────────────────────────────────────────────────────────────
 app.use(express.json({
@@ -79,6 +83,18 @@ app.post('/slack/commands', async (req, res) => {
 
   if (command === '/scrape') {
     return handleScrapeCommand(req, res, text, callerId)
+  }
+
+  if (command === '/whois') {
+    return handleWhoisCommand(res, text)
+  }
+
+  if (command === '/pipeline') {
+    return handlePipelineCommand(res)
+  }
+
+  if (command === '/offboard') {
+    return handleOffboardCommand(req, res, text, callerId)
   }
 
   if (command !== '/onboard') {
@@ -147,6 +163,7 @@ async function runOnboardingFlow(targetSlackId, callerId, role = 'AI Department'
   const result = await onboarding.onboardNewHire(hire)
   hire.channelId = result.channelId
   registry.addHire(hire)
+  peoplemap.postPeopleMap().catch(() => {})
 
   // Step 2: Share onboarding documents from source channels
   await onboarding.shareOnboardingDocuments(hire)
@@ -157,6 +174,160 @@ async function runOnboardingFlow(targetSlackId, callerId, role = 'AI Department'
   }
 
   console.log(`✅ Onboarding flow complete for ${name}`)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /whois — look up a hire by @mention
+// ─────────────────────────────────────────────────────────────────────────────
+function handleWhoisCommand(res, text) {
+  const mentionMatch = (text || '').match(/<@([A-Z0-9]+)(?:\|[^>]+)?>/)
+  const slackId = mentionMatch ? mentionMatch[1] : null
+
+  if (!slackId) {
+    return res.json({ text: '❌ Usage: `/whois @username`' })
+  }
+
+  const hire = registry.getHireBySlackId(slackId)
+  if (!hire) {
+    return res.json({ text: 'Not found in registry. They may not have been onboarded via /onboard yet.' })
+  }
+
+  const today = new Date()
+  const start = new Date(hire.startDate)
+  const daysSinceStart = isNaN(start.getTime()) ? 0 : Math.floor((today - start) / (1000 * 60 * 60 * 24))
+  const dloasThisWeek = cronJobs.getDLOAs(slackId).filter(d => {
+    const weekAgo = new Date(); weekAgo.setDate(weekAgo.getDate() - 7)
+    return new Date(d.date) >= weekAgo
+  }).length
+
+  const lastActive = hire.lastActiveAt
+    ? new Date(hire.lastActiveAt).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })
+    : 'Never recorded'
+
+  return res.json({
+    blocks: [
+      { type: 'header', text: { type: 'plain_text', text: `👤 ${hire.name}` } },
+      {
+        type: 'section',
+        fields: [
+          { type: 'mrkdwn', text: `*Role:*\n${hire.role}` },
+          { type: 'mrkdwn', text: `*Day:*\n${daysSinceStart} of 90` },
+          { type: 'mrkdwn', text: `*Status:*\n${hire.status || 'active'}` },
+          { type: 'mrkdwn', text: `*Last active:*\n${lastActive}` },
+          { type: 'mrkdwn', text: `*DLOAs this week:*\n${dloasThisWeek}` },
+          { type: 'mrkdwn', text: `*Project:*\n${hire.project || 'Not set'}` }
+        ]
+      },
+      ...(hire.channelId ? [{
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text: `Channel: <#${hire.channelId}>` }]
+      }] : [])
+    ]
+  })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /pipeline — overview of all active onboardees
+// ─────────────────────────────────────────────────────────────────────────────
+function handlePipelineCommand(res) {
+  const hires = registry.getActiveOnboardees()
+
+  if (hires.length === 0) {
+    return res.json({ text: 'No active onboardees.' })
+  }
+
+  const blocks = [
+    { type: 'header', text: { type: 'plain_text', text: `🚀 Onboarding Pipeline — ${hires.length} active` } },
+    { type: 'divider' }
+  ]
+
+  for (const hire of hires) {
+    const weekAgo = new Date(); weekAgo.setDate(weekAgo.getDate() - 7)
+    const dloasThisWeek = cronJobs.getDLOAs(hire.slackId).filter(d => new Date(d.date) >= weekAgo).length
+
+    blocks.push({
+      type: 'section',
+      fields: [
+        { type: 'mrkdwn', text: `*${hire.name}*\n${hire.role}` },
+        { type: 'mrkdwn', text: `Day ${hire.daysSinceStart}/90 · Status: ${hire.status || 'active'} · DLOAs: ${dloasThisWeek}/5` }
+      ]
+    })
+    blocks.push({ type: 'divider' })
+  }
+
+  return res.json({ blocks })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /offboard — archive channel and remove hire
+// ─────────────────────────────────────────────────────────────────────────────
+async function handleOffboardCommand(req, res, text, callerId) {
+  const allowed = [process.env.TAULANT_SLACK_ID, process.env.TYLER_SLACK_ID].filter(Boolean)
+  if (allowed.length && !allowed.includes(callerId)) {
+    return res.json({ text: '⛔ Only Taulant or Tyler can run /offboard.' })
+  }
+
+  const mentionMatch = (text || '').match(/<@([A-Z0-9]+)(?:\|[^>]+)?>/)
+  const slackId = mentionMatch ? mentionMatch[1] : null
+
+  if (!slackId) {
+    return res.json({ text: '❌ Usage: `/offboard @username`' })
+  }
+
+  const hire = registry.getHireBySlackId(slackId)
+  if (!hire) {
+    return res.json({ text: 'Not found in registry.' })
+  }
+
+  // Acknowledge immediately
+  res.json({ text: `⏳ Offboarding <@${slackId}> (${hire.name})...` })
+
+  const adminChannel = process.env.ADMIN_CHANNEL_ID
+
+  try {
+    // Generate 90-day summary
+    const allDLOAs = cronJobs.getDLOAs(slackId).map(d => d.text)
+    const today = new Date()
+    const start = new Date(hire.startDate)
+    const daysSinceStart = isNaN(start.getTime()) ? 0 : Math.floor((today - start) / (1000 * 60 * 60 * 24))
+    const hireData = { name: hire.name, role: hire.role, daysSinceStart }
+    const summary = await claudeAI.generateWeeklySummary(hireData, allDLOAs)
+
+    if (adminChannel) {
+      await slack.postToChannel(adminChannel, {
+        blocks: [
+          { type: 'header', text: { type: 'plain_text', text: `📋 90-Day Summary: ${hire.name}` } },
+          { type: 'section', text: { type: 'mrkdwn', text: summary || 'No DLOAs on record.' } },
+          { type: 'context', elements: [{ type: 'mrkdwn', text: `Role: ${hire.role} · Days: ${daysSinceStart} · Offboarded by <@${callerId}>` }] }
+        ]
+      }).catch(() => {})
+    }
+
+    // Archive their personal channel
+    if (hire.channelId) {
+      await slack.client.conversations.archive({ channel: hire.channelId }).catch(() => {})
+    }
+
+    // Remove from universal channels
+    const universalChannels = (process.env.UNIVERSAL_CHANNELS || '').split(',').filter(Boolean)
+    for (const ch of universalChannels) {
+      await slack.client.conversations.kick({ channel: ch.trim(), user: slackId }).catch(() => {})
+    }
+
+    registry.setStatus(slackId, 'offboarded')
+
+    // Post updated people map
+    await peoplemap.postPeopleMap().catch(() => {})
+
+    console.log(`✅ Offboarding complete for ${hire.name}`)
+  } catch (err) {
+    console.error('Offboard error:', err.message)
+    if (adminChannel) {
+      await slack.postToChannel(adminChannel, {
+        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `❌ Offboarding failed for <@${slackId}>: ${err.message}` } }]
+      }).catch(() => {})
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -303,6 +474,44 @@ async function handleSlackEvent(event) {
 
   if (event.type === 'message' && event.channel_type !== 'im' && event.text) {
     await handleChannelMessage(event)
+
+    // Thread summarisation — trigger when a thread hits 10 replies
+    if (event.thread_ts && event.thread_ts !== event.ts) {
+      try {
+        const countResult = await slack.client.conversations.replies({
+          channel: event.channel,
+          ts: event.thread_ts,
+          limit: 1
+        })
+        const replyCount = countResult.messages?.[0]?.reply_count || 0
+        const threadKey = `${event.channel}:${event.thread_ts}`
+
+        if (replyCount === 10 && !summarisedThreads.has(threadKey)) {
+          summarisedThreads.add(threadKey)
+
+          const fullThread = await slack.client.conversations.replies({
+            channel: event.channel,
+            ts: event.thread_ts,
+            limit: 50
+          })
+          const msgTexts = (fullThread.messages || [])
+            .filter(m => !m.bot_id && m.text)
+            .map(m => m.text)
+
+          const channelName = event.channel_name || event.channel
+          const summary = await claudeAI.summariseThread(channelName, msgTexts)
+          if (summary) {
+            await slack.client.chat.postMessage({
+              channel: event.channel,
+              thread_ts: event.thread_ts,
+              text: `📝 *Thread TL;DR (${replyCount} replies):*\n${summary}`
+            })
+          }
+        }
+      } catch (err) {
+        console.error('Thread summarisation error:', err.message)
+      }
+    }
     return
   }
 
@@ -328,6 +537,9 @@ async function handleMention(event) {
   const question = (event.text || '').replace(/<@[A-Z0-9]+>/g, '').trim()
 
   if (!question) return
+
+  registry.updateLastActive(userId)
+  registry.logQuestion(question)
 
   console.log(`💬 @mention from ${userId}: ${question.substring(0, 80)}`)
 
@@ -374,6 +586,21 @@ async function handleChannelMessage(event) {
     ingest.ingestEvent(event, channelName).catch(() => {})
   }
 
+  // Tagging warning: untagged question in channel
+  if (
+    text.includes('?') &&
+    !text.includes('<@') &&
+    text.length > 40 &&
+    !slack.looksLikeDLOA(text) &&
+    !event.bot_id
+  ) {
+    slack.client.chat.postMessage({
+      channel: channelId,
+      thread_ts: event.ts,
+      text: "Hey! If you need help from a specific person, tag them with @name so they see it. Otherwise I'll try to help — just ask me directly."
+    }).catch(() => {})
+  }
+
   if (!slack.looksLikeDLOA(text)) return
 
   console.log(`📝 DLOA detected from ${userId}`)
@@ -391,13 +618,15 @@ async function handleChannelMessage(event) {
 
   const hireData = { name: hire.name, role: hire.role, daysSinceStart: hire.daysSinceStart }
 
-  const analysis = await claudeAI.analyseDLOA(
+  const analysisResult = await claudeAI.analyseDLOA(
     hireData, text, cronJobs.getDLOAs(userId).slice(-3).map(d => d.text)
   ).catch(() => null)
 
   const adminChannel = process.env.ADMIN_CHANNEL_ID
-  if (adminChannel && analysis) {
-    await slack.postToChannel(adminChannel, messages.dloaAnalysisMessage(hireData, analysis))
+  if (adminChannel && analysisResult) {
+    const { text: analysisText, score } = analysisResult
+    if (score != null) registry.addDloaScore(userId, score)
+    await slack.postToChannel(adminChannel, messages.dloaAnalysisMessage(hireData, analysisText, score))
   }
 
   const dloaTitle = `DLOA: ${hire.name} — ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`
@@ -412,6 +641,9 @@ async function handleDM(event) {
   if (!text.trim()) return
 
   console.log(`💬 DM from ${userId}: ${text.substring(0, 60)}`)
+
+  registry.updateLastActive(userId)
+  registry.logQuestion(text)
 
   // Priority 1: standup reply
   if (standup.isAwaitingStandup(userId)) {
@@ -568,7 +800,8 @@ app.get('/cron/morning', async (req, res) => {
   await Promise.allSettled([
     cronJobs.sendDayOneMessages(),
     cronJobs.sendCheckinReminders(),
-    standup.sendStandupDMs()           // 9am: DM each hire for standup
+    standup.sendStandupDMs(),          // 9am: DM each hire for standup
+    cronJobs.checkSilentHires()
   ])
 })
 
@@ -606,6 +839,18 @@ app.get('/cron/weekly', async (req, res) => {
     cronJobs.sendWeeklySummaries(),
     cronJobs.checkRiskFlags()          // Friday: risk flags for Tyler + Taulant
   ])
+})
+
+app.get('/cron/silence-check', async (req, res) => {
+  if (!isCronAuthorised(req)) return res.status(403).json({ error: 'Unauthorized' })
+  res.json({ ok: true })
+  await cronJobs.checkSilentHires().catch(console.error)
+})
+
+app.get('/cron/weekly-digest', async (req, res) => {
+  if (!isCronAuthorised(req)) return res.status(403).json({ error: 'Unauthorized' })
+  res.json({ ok: true })
+  await cronJobs.sendWeeklyKnowledgeDigest().catch(console.error)
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
